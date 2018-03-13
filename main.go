@@ -6,14 +6,15 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/gehaxelt/ds_store"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"os"
-	"sync"
 	"strings"
+	"sync"
 	"time"
-	"net"
+
+	"github.com/gehaxelt/ds_store"
 )
 
 type File struct {
@@ -23,7 +24,6 @@ type File struct {
 
 type Result struct {
 	URL   string
-	Data  []byte
 	Found bool
 	Files []File
 }
@@ -38,45 +38,52 @@ type Parameters struct {
 	statusCode bool
 	recursive  bool
 	Client     *http.Client
-	Timeout		int
-	domainChan	chan string
-	resultChan  chan Result
+	Timeout    int
+	MaxDepth   int
+	domainChan chan string
+	jobChan    chan Job
+	resultChan chan Result
 }
 
-func scanDomain(ps *Parameters, domain string) {
+type DSStore struct {
+	Data       []byte
+	StatusCode int
+}
+
+type Job struct {
+	Domain string
+	Depth  int
+	Parent *DSStore
+}
+
+func (job *Job) scanDomain(ps *Parameters, addWork func(Job)) {
+
+	if job.Depth == ps.MaxDepth {
+		return
+	}
 
 	var err error
 	found := true
 	files := make([]File, 0)
-	url := prepareUrl(ps, domain)
-	data := downloadDS_Store(ps, url+".DS_Store")
-	if data == nil {
-		found = false
+	url := prepareUrl(ps, job.Domain)
+	dsstore := downloadDS_Store(ps, url+".DS_Store")
+	if dsstore == nil || dsstore.Data == nil || len(dsstore.Data) == 0 {
+		ps.resultChan <- Result{
+			URL:   url,
+			Found: false,
+			Files: files,
+		}
+		return
+	}
+
+	if job.Parent != nil && string(job.Parent.Data) == string(dsstore.Data) {
+		return
 	}
 
 	if ps.listFiles {
-		files, err = parseDS_Store(data)
+		files, err = parseDS_Store(dsstore.Data)
 		if err != nil {
 			found = false
-		}
-	}
-
-	if ps.recursive {
-		var rekFiles []File
-		
-		if files != nil && len(files) == 0 {
-			rekFiles, err = parseDS_Store(data)
-		} else {
-			rekFiles = files
-		}
-		
-		if rekFiles != nil {
-			for _, file := range rekFiles {
-				if ! isDir(file) {
-					continue
-				}
-				ps.domainChan <- url + file.FileName
-			}
 		}
 	}
 
@@ -84,23 +91,52 @@ func scanDomain(ps *Parameters, domain string) {
 		checkOnlineStatus(ps, url, &files)
 	}
 
+	if ps.recursive {
+		var rekFiles []File
+
+		if files != nil && len(files) == 0 {
+			rekFiles, _ = parseDS_Store(dsstore.Data)
+		} else {
+			rekFiles = files
+		}
+
+		if rekFiles != nil {
+			for _, file := range rekFiles {
+				if file.StatusCode == 404 || dsstore.StatusCode == 404 {
+					continue
+				}
+				var i int
+				if ps.statusCode {
+					i = file.StatusCode
+				} else {
+					i = dsstore.StatusCode
+				}
+				if !isDir(file, i) {
+					continue
+				}
+
+				addWork(Job{Domain: url + file.FileName, Depth: job.Depth + 1, Parent: dsstore})
+			}
+		}
+	}
+
 	ps.resultChan <- Result{
 		URL:   url,
 		Found: found,
-		Data:  data,
 		Files: files,
 	}
 }
 
-func isDir(file File) (ok bool) {
-	if file.StatusCode == -1 && ! strings.Contains(file.FileName, ".") {
+func isDir(file File, StatusCode int) (ok bool) {
+	if StatusCode == 403 {
 		return true
 	}
-	if file.StatusCode == 200 && ! strings.Contains(file.FileName, ".") {
-		return true
-	}
-	if file.StatusCode == 403 {
-		return true
+	if StatusCode == 200 {
+		if hasSlash(file.FileName) {
+			return true
+		} else if !strings.Contains(file.FileName, ".") {
+			return true
+		}
 	}
 	return false
 }
@@ -126,6 +162,9 @@ func prepareUrl(ps *Parameters, domain string) string {
 }
 
 func hasSlash(url string) bool {
+	if len(url) == 0 {
+		return false
+	}
 	c := url[len(url)-1:]
 
 	if c == "/" {
@@ -147,7 +186,9 @@ func hasProtocol(url string, https bool) bool {
 	return false
 }
 
-func downloadDS_Store(ps *Parameters, url string) []byte {
+func downloadDS_Store(ps *Parameters, url string) (dsstore *DSStore) {
+	dsstore = &DSStore{StatusCode: -1}
+
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil
@@ -155,34 +196,50 @@ func downloadDS_Store(ps *Parameters, url string) []byte {
 
 	resp, err := ps.Client.Do(req)
 	if err != nil {
+		if resp != nil {
+			dsstore.StatusCode = resp.StatusCode
+			return dsstore
+		}
 		return nil
 	}
 
+	dsstore.StatusCode = resp.StatusCode
 	defer resp.Body.Close()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	defer func() {
+		//https://stackoverflow.com/questions/25025467/catching-panics-in-golang
+		// recover from panic if one occured. Set err to nil otherwise.
+		if recover() != nil {
+			err = errors.New("DS_Store parsing error")
+		}
+	}()
+
+	dsstore.Data, err = ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return nil
 	}
 
-	if len(body) < 8 {
+	if len(dsstore.Data) < 8 {
 		return nil
 	}
 
 	//magic number 0 0 0 1
-	if body[0] != 0x0 && body[1] != 0x0 && body[2] != 0x0 && body[3] != 0x1 {
+	if dsstore.Data[0] != 0x0 && dsstore.Data[1] != 0x0 && dsstore.Data[2] != 0x0 && dsstore.Data[3] != 0x1 {
 		return nil
 	}
 
 	//magic number 42 75 64 31
-	if body[4] != 0x42 && body[5] != 0x75 && body[6] != 0x64 && body[7] != 0x31 {
+	if dsstore.Data[4] != 0x42 && dsstore.Data[5] != 0x75 && dsstore.Data[6] != 0x64 && dsstore.Data[7] != 0x31 {
 		return nil
 	}
 
-	return body
+	return dsstore
 }
 
 func parseDS_Store(data []byte) (files []File, err error) {
+	if data == nil || len(data) < 32 {
+		return nil, errors.New("No data")
+	}
 	a, err := ds_store.NewAllocator(data)
 	if err != nil {
 		return nil, errors.New("Failed to parse .DS_Store file")
@@ -282,13 +339,14 @@ func main() {
 
 	flag.IntVar(&ps.Threads, "t", 10, "Number of concurrent threads")
 	flag.IntVar(&ps.Timeout, "q", 10, "Timeout in seconds")
+	flag.IntVar(&ps.MaxDepth, "d", 7, "Maximum recursion depth")
 	flag.StringVar(&ps.DomainList, "i", "", "Path to domain list")
 	flag.BoolVar(&ps.Https, "s", false, "Use SSL (HTTPS) connection")
 	flag.BoolVar(&ps.Verbose, "v", false, "Verbose output (errors)")
 	flag.BoolVar(&ps.listFiles, "l", false, "Parse .DS_Store and list files")
 	flag.BoolVar(&ps.extendUrl, "e", false, "Preprend the URL to found files. Implies -l")
 	flag.BoolVar(&ps.statusCode, "c", false, "Send HEAD request and show status code. Implies -l")
-	flag.BoolVar(&ps.recursive, "r", false, "Recursively scan directories for .DS_Store")
+	flag.BoolVar(&ps.recursive, "r", false, "Recursively scan directories for .DS_Store.")
 
 	flag.Parse()
 
@@ -299,6 +357,11 @@ func main() {
 
 	if ps.Timeout < 0 {
 		fmt.Println("Timeout (-q): Invalid value:", ps.Timeout)
+		corrrectFlags = false
+	}
+
+	if ps.MaxDepth <= 0 {
+		fmt.Println("MaxDepth (-d): Invalid value:", ps.MaxDepth)
 		corrrectFlags = false
 	}
 
@@ -321,7 +384,7 @@ func main() {
 				TLSClientConfig: &tls.Config{
 					InsecureSkipVerify: true,
 				},
-				Dial: NewDialTimeout(timeout),
+				Dial:                NewDialTimeout(timeout),
 				DisableKeepAlives:   true,
 				MaxIdleConnsPerHost: 50,
 			},
@@ -335,25 +398,20 @@ func main() {
 		panic("Failed to open domainlist")
 	}
 
-	ps.domainChan = make(chan string, ps.Threads)
+	ps.jobChan = make(chan Job)
 	ps.resultChan = make(chan Result)
+	var addWork func(Job)
 
 	workerPool := new(sync.WaitGroup)
-	workerPool.Add(ps.Threads)
+	//workerPool.Add(ps.Threads)
 	printerPool := new(sync.WaitGroup)
 	printerPool.Add(1)
 
 	for i := 0; i < ps.Threads; i++ {
 		go func() {
-			defer workerPool.Done()
-			for {
-				domain := <-ps.domainChan
-
-				if domain == "" {
-					break
-				}
-
-				scanDomain(&ps, domain)
+			for job := range ps.jobChan {
+				job.scanDomain(&ps, addWork)
+				workerPool.Done()
 			}
 		}()
 	}
@@ -367,26 +425,38 @@ func main() {
 
 	defer domainListFile.Close()
 
+	// how to queue a job
+	addWork = func(job Job) {
+		workerPool.Add(1)
+		select {
+		case ps.jobChan <- job: // another worker took it
+		default: // no free worker; do the job now
+			job.scanDomain(&ps, addWork)
+			workerPool.Done()
+		}
+	}
+
 	lineScanner := bufio.NewScanner(domainListFile)
 	for lineScanner.Scan() {
 		domain := lineScanner.Text()
-		ps.domainChan <- domain
+		//ps.domainChan <- domain
+		addWork(Job{Domain: domain})
 	}
 
-	close(ps.domainChan)
 	workerPool.Wait()
+	close(ps.jobChan)
 	close(ps.resultChan)
 	printerPool.Wait()
 }
 
 //Inspired by http://stackoverflow.com/questions/16895294/how-to-set-timeout-for-http-get-requests-in-golang#
 func NewDialTimeout(timeout time.Duration) func(net, addr string) (c net.Conn, err error) {
-    return func(netw, addr string) (net.Conn, error) {
-        conn, err := net.DialTimeout(netw, addr, timeout)
-        if err != nil {
-            return nil, err
-        }
-        conn.SetDeadline(time.Now().Add(timeout))
-        return conn, nil
-    }
+	return func(netw, addr string) (net.Conn, error) {
+		conn, err := net.DialTimeout(netw, addr, timeout)
+		if err != nil {
+			return nil, err
+		}
+		conn.SetDeadline(time.Now().Add(timeout))
+		return conn, nil
+	}
 }
